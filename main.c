@@ -18,6 +18,8 @@
 /*---------------------------------------------------------------------------------------------------------*/
 /* Define global constants                                                                   			   */
 /*---------------------------------------------------------------------------------------------------------*/
+#define JACE_TEST
+
 #define SAMPLE_RATE              (48000)
 
 /*---------------------------------------------------------------------------------------------------------*/
@@ -29,6 +31,10 @@ void SPK_Stop(void);
 void MIC_Init(S_BUFCTRL* psInBufCtrl);
 void MIC_Start(void);
 void MIC_Stop(void);
+#ifdef JACE_TEST
+void SPI_Init(S_BUFCTRL* psSpiOutBufCtrl);
+void SPI_Start(void);
+#endif
 
 /*---------------------------------------------------------------------------------------------------------*/
 /* Define global variables and constants                                                                   */
@@ -36,6 +42,10 @@ void MIC_Stop(void);
 volatile S_BUFCTRL sInBufCtrl,sOutBufCtrl;// Buffer control handler.
 int32_t    ai32InBuf[256];  	  // Buffer array: store audio data receiced from I2S(85L40)
 int32_t    ai32OutBuf[128]; 	  // Buffer array: store audio data ready to send to DPWM
+#ifdef JACE_TEST
+volatile S_BUFCTRL sSpiOutBufCtrl;
+int32_t    ai32SpiOutBuf[128];
+#endif
 
 /*---------------------------------------------------------------------------------------------------------*/
 /*  Main Function                                                                                          */
@@ -43,6 +53,10 @@ int32_t    ai32OutBuf[128]; 	  // Buffer array: store audio data ready to send t
 int32_t main(void) 
 {
 	int32_t i32Data1, i32Data2;
+#ifdef JACE_TEST
+	int32_t i32SPIOutData;
+	uint8_t nCount = 0;
+#endif
 	
 	// Initiate system clock(Configure in ConfigSysClk.h)
 	SYSCLK_INITIATE();
@@ -53,7 +67,14 @@ int32_t main(void)
 	BUFCTRL_CFG((&sOutBufCtrl),ai32OutBuf,sizeof(ai32OutBuf)/sizeof(uint32_t));
 	// full empty data into output buffer.
 	sOutBufCtrl.u16DataCount = sOutBufCtrl.u16BufCount;  
+#ifdef JACE_TEST
+	BUFCTRL_CFG((&sSpiOutBufCtrl),ai32SpiOutBuf,sizeof(ai32SpiOutBuf)/sizeof(uint32_t));
+	sSpiOutBufCtrl.u16DataCount = sSpiOutBufCtrl.u16BufCount;  
+#endif
 	
+    GPIO_SetMode(PC, BIT3, GPIO_MODE_OUTPUT);  
+	PC3 = 1;
+
 	// Initiate speaker.
 	SPK_Init((S_BUFCTRL*)&sOutBufCtrl);
 	// Initiate microphone.
@@ -63,24 +84,135 @@ int32_t main(void)
 	MIC_Start();
 	// Start speaker.
 	SPK_Start();
-	
+
+#ifdef JACE_TEST
+	SPI_Init((S_BUFCTRL*)&sSpiOutBufCtrl);
+	SPI_Start();
+#endif
+
 	// while loop for processing.
 	while(1) 
 	{
-		while( BUFCTRL_GET_COUNT((&sInBufCtrl))>= 2 && !BUFCTRL_IS_FULL((&sOutBufCtrl)) )
+		while( BUFCTRL_GET_COUNT((&sInBufCtrl))>= 2/* && !BUFCTRL_IS_FULL((&sOutBufCtrl)) && !BUFCTRL_IS_FULL((&sSpiOutBufCtrl))*/ ) // JACE_TEST
 		{
 			/* 4 channel mixer to 2 channel. */
 			BUFCTRL_READ((&sInBufCtrl),&i32Data1);
 			BUFCTRL_READ((&sInBufCtrl),&i32Data2);
-			
+
+#ifdef JACE_TEST
+			if(nCount == 1)
+			{
+				nCount = 0;
+			}
+			else
+			{
+				nCount++;
+				i32SPIOutData = (i32Data2 & 0xFFFF0000) | ((i32Data1 >> 16) & 0x0000FFFF);
+				BUFCTRL_WRITE((&sSpiOutBufCtrl),i32SPIOutData);
+			}
+
+			{
+				i32Data1 = SPI_I2S_READ_RX_FIFO(SPI2);
+				i32Data1 >>= 1;
+				BUFCTRL_WRITE((&sOutBufCtrl),i32Data1);
+			}
+#else
 			i32Data1 >>= 1;
             i32Data2 >>= 1;
 			i32Data1 += i32Data2;
 			
 			BUFCTRL_WRITE((&sOutBufCtrl),i32Data1);
+#endif
 		}
 	};
 }
+
+#ifdef JACE_TEST
+S_BUFCTRL* psSPI_BufCtrl = NULL;            // Provide SPI to output data.
+
+void SPI_Init(S_BUFCTRL* psSpiOutBufCtrl)
+{
+	/* Select PCLK0 as the clock source of SPI2 */
+	CLK_SetModuleClock(SPI2_MODULE, CLK_CLKSEL2_SPI2SEL_PCLK0, MODULE_NoMsk);
+
+	/* Enable peripheral clock */
+	CLK_EnableModuleClock(SPI2_MODULE);
+	
+	/* Set SPI2 multi-function pins */
+	SYS->GPC_MFPL = (SYS->GPC_MFPL & ~(SYS_GPC_MFPL_PC5MFP_Msk | SYS_GPC_MFPL_PC6MFP_Msk | SYS_GPC_MFPL_PC7MFP_Msk)) | 
+	(SYS_GPC_MFPL_PC5MFP_SPI2_MOSI | SYS_GPC_MFPL_PC6MFP_SPI2_MISO | SYS_GPC_MFPL_PC7MFP_SPI2_CLK);  
+	
+	SYS->GPC_MFPH = (SYS->GPC_MFPH & ~(SYS_GPC_MFPH_PC8MFP_Msk)) | (SYS_GPC_MFPH_PC8MFP_SPI2_SS);
+
+	/* Slave mode, 16-bit word width, stereo mode, I2S format. Set TX and RX FIFO threshold to middle value. */
+	/* I2S peripheral clock rate is equal to PCLK0 clock rate. */
+	SPI_I2SOpen(SPI2, SPI_I2SSLAVE, 0, SPI_I2SDATABIT_16, SPI_I2SSTEREO, SPI_I2SFORMAT_I2S);
+
+	/* Enable TX threshold level interrupt */
+	SPI_I2S_SET_TXTH(SPI2, SPI_I2S_FIFO_TX_LEVEL_8);
+	SPI_I2SEnableInt(SPI2, SPI_I2S_TXTH_INT_MASK);
+	SPI_I2S_RST_TX_FIFO(SPI2);
+	SPI_I2S_RST_RX_FIFO(SPI2);
+	NVIC_EnableIRQ(SPI2_IRQn);
+
+	psSPI_BufCtrl = psSpiOutBufCtrl;
+
+}
+
+void SPI_Start(void)
+{
+	if( psSPI_BufCtrl != NULL )
+	{
+		// Enable I2S.
+		SPI_I2SEnableControl(SPI2);
+		SPI_I2S_ENABLE_TX(SPI2);
+		SPI_I2S_ENABLE_RX(SPI2);
+	}
+	
+}
+
+void SPI2_IRQHandler()
+{
+	uint32_t u32Tmp, i;
+
+#if 0
+	if( BUFCTRL_IS_EMPTY(psSPI_BufCtrl) ) 
+	{
+		if( SPI_GET_RX_FIFO_EMPTY_FLAG(SPI2) )
+		{
+			for( i = 0; i < 8; i++ )
+				SPI_I2S_WRITE_TX_FIFO(SPI2, 0);
+		}
+	} 
+	else 
+	{
+		for(i = 0; i < 4; i++)
+		{
+			if(!SPI_GET_TX_FIFO_FULL_FLAG(SPI2)) 
+			{
+				if( !BUFCTRL_IS_EMPTY(psSPI_BufCtrl) )
+				{
+					BUFCTRL_READ(psSPI_BufCtrl, &u32Tmp);
+					SPI_I2S_WRITE_TX_FIFO(SPI2, u32Tmp);
+				}
+			}
+			else
+				break;
+		}
+	}
+#else
+	if( !BUFCTRL_IS_EMPTY(psSPI_BufCtrl) )
+	{
+		BUFCTRL_READ(psSPI_BufCtrl, &u32Tmp);
+		SPI_I2S_WRITE_TX_FIFO(SPI2, u32Tmp);
+	}
+	else
+	{
+		//printf("psSPI_BufCtrl empty\n");
+	}
+#endif
+}
+#endif
 
 // Speaker(DPWM) = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 S_BUFCTRL* psSPK_BufCtrl = NULL;            // Provide Speaker to output data.
@@ -341,6 +473,7 @@ void I2S0_IRQHandler()
 {
 	uint32_t u32Tmp, i; 
 	
+	//PC3 ^= 1;
 	for(i=0; i<8; i++)
     {
 		if(!I2S_GET_RX_IS_EMPTY(I2S0))
@@ -349,7 +482,7 @@ void I2S0_IRQHandler()
 			u32Tmp = I2S_READ_RX_FIFO(I2S0);
 			
 			// Write the data from I2S RXFIFO to buffer.
-			if(!BUFCTRL_IS_FULL(psMIC_BufCtrl) && psSPK_BufCtrl != NULL)
+			if(!BUFCTRL_IS_FULL(psMIC_BufCtrl)/* && psSPK_BufCtrl != NULL*/ && psSPI_BufCtrl != NULL) // JACE_TEST
 				BUFCTRL_WRITE(psMIC_BufCtrl,u32Tmp);
 		}
 		else
